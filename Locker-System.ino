@@ -5,51 +5,55 @@
 #include <ThreeWire.h>
 #include <RtcDS1302.h>
 
-#define RELAY1 D1
-#define RELAY2 D4
+const byte openRelayPin = D1;
+const byte closeRelayPin = D4;
 
-#define RFID_RX D5
-#define RFID_TX D0
+const byte rfidRxPin = D5;
+const byte rfidTxPin = D2;
 
-#define RTC_CLK D6
-#define RTC_DAT D7
-#define RTC_RST D0
+const byte rtcClockPin = D6;
+const byte rtcDataPin = D7;
+const byte rtcResetPin = D0;
 
-#define RELAY_ON HIGH
-#define RELAY_OFF LOW
+const byte relayOn = HIGH;
+const byte relayOff = LOW;
 
-#define MAX_CARDS 5
-#define MAX_LOGS 20
+const int maxCards = 5;
+const int maxLogs = 20;
 
-const char* WIFI_SSID = "RFID-QS-1";
-const char* WIFI_PASS = "12345678";
+const char* wifiName = "RFID-QS-1";
+const char* wifiPassword = "12345678";
 
 String masterCard = "0209010E1C80B32903";
 String emergencyCode = "1234";
 
-SoftwareSerial RFID(RFID_RX, RFID_TX);
+SoftwareSerial rfid(rfidRxPin, rfidTxPin);
 ESP8266WebServer server(80);
-ThreeWire myWire(RTC_DAT, RTC_CLK, RTC_RST);
-RtcDS1302<ThreeWire> Rtc(myWire);
+
+ThreeWire rtcWire(rtcDataPin, rtcClockPin, rtcResetPin);
+RtcDS1302<ThreeWire> rtc(rtcWire);
 
 struct Card {
   String uid;
   String name;
 };
 
-Card cards[MAX_CARDS];
+Card cards[maxCards];
+String logs[maxLogs];
+
 int cardCount = 0;
-String logs[MAX_LOGS];
 int logCount = 0;
 
-bool nextRelay = false;
-bool learnMode = false;
-String pendingCard = "";
-String statusText = "Bereit";
-String lastAction = "Keine Aktion";
+bool closeNext = false;
+bool learningMode = false;
+
+String newCardUid = "";
+String statusText = "Ready";
+String lastAction = "No action yet";
+
 unsigned long lastCardTime = 0;
 
-String normalizeUid(String uid) {
+String cleanUid(String uid) {
   uid.trim();
   uid.toUpperCase();
   uid.replace(" ", "");
@@ -60,493 +64,765 @@ String normalizeUid(String uid) {
   return uid;
 }
 
-String byteToHex2(byte b) {
-  String s = String(b, HEX);
-  if (s.length() < 2) s = "0" + s;
-  s.toUpperCase();
-  return s;
+String byteToHex(byte value) {
+  String text = String(value, HEX);
+
+  if (text.length() < 2) {
+    text = "0" + text;
+  }
+
+  text.toUpperCase();
+  return text;
 }
 
-String urlDecode(String s) {
-  s.replace("+", " ");
-  String out = "";
-  for (unsigned int i = 0; i < s.length(); i++) {
-    if (s[i] == '%' && i + 2 < s.length()) {
-      char hex[3] = { s[i + 1], s[i + 2], 0 };
-      out += char(strtol(hex, NULL, 16));
+String decodeUrl(String text) {
+  text.replace("+", " ");
+
+  String result = "";
+
+  for (unsigned int i = 0; i < text.length(); i++) {
+    if (text[i] == '%' && i + 2 < text.length()) {
+      char hex[3] = { text[i + 1], text[i + 2], 0 };
+      result += char(strtol(hex, NULL, 16));
       i += 2;
     } else {
-      out += s[i];
+      result += text[i];
     }
   }
-  return out;
+
+  return result;
 }
 
-String htmlEscape(String s) {
-  s.replace("&", "&amp;");
-  s.replace("<", "&lt;");
-  s.replace(">", "&gt;");
-  s.replace("\"", "&quot;");
-  return s;
+String safeText(String text) {
+  text.replace("&", "&amp;");
+  text.replace("<", "&lt;");
+  text.replace(">", "&gt;");
+  text.replace("\"", "&quot;");
+  return text;
 }
 
-void relaysOff() {
-  digitalWrite(RELAY1, RELAY_OFF);
-  digitalWrite(RELAY2, RELAY_OFF);
+void turnRelaysOff() {
+  digitalWrite(openRelayPin, relayOff);
+  digitalWrite(closeRelayPin, relayOff);
 }
 
-void relayPulse(int pin) {
-  relaysOff();
+void pulseRelay(byte pin) {
+  turnRelaysOff();
   delay(80);
-  digitalWrite(pin, RELAY_ON);
+
+  digitalWrite(pin, relayOn);
   delay(700);
-  digitalWrite(pin, RELAY_OFF);
+
+  digitalWrite(pin, relayOff);
   delay(80);
-  relaysOff();
+
+  turnRelaysOff();
 }
 
-String nowTime() {
-  RtcDateTime now = Rtc.GetDateTime();
-  if (!now.IsValid()) return "00.00.0000 00:00:00";
-  char buf[25];
-  sprintf(buf, "%02u.%02u.%04u %02u:%02u:%02u", now.Day(), now.Month(), now.Year(), now.Hour(), now.Minute(), now.Second());
-  return String(buf);
+String currentTime() {
+  RtcDateTime now = rtc.GetDateTime();
+
+  if (!now.IsValid()) {
+    return "00.00.0000 00:00:00";
+  }
+
+  char text[25];
+
+  sprintf(
+    text,
+    "%02u.%02u.%04u %02u:%02u:%02u",
+    now.Day(),
+    now.Month(),
+    now.Year(),
+    now.Hour(),
+    now.Minute(),
+    now.Second()
+  );
+
+  return String(text);
 }
 
-void setupRtc() {
-  Rtc.Begin();
-  Rtc.SetIsWriteProtected(false);
-  if (!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
+void startClock() {
+  rtc.Begin();
+  rtc.SetIsWriteProtected(false);
+
+  if (!rtc.GetIsRunning()) {
+    rtc.SetIsRunning(true);
+  }
 }
 
-void saveConfig() {
-  File f = LittleFS.open("/config.txt", "w");
-  if (!f) return;
-  f.println(normalizeUid(masterCard));
-  f.println(emergencyCode);
-  f.println(nextRelay ? "1" : "0");
-  f.close();
-}
+void saveSettings() {
+  File file = LittleFS.open("/settings.txt", "w");
 
-void loadConfig() {
-  if (!LittleFS.exists("/config.txt")) {
-    saveConfig();
+  if (!file) {
     return;
   }
-  File f = LittleFS.open("/config.txt", "r");
-  if (!f) return;
-  masterCard = normalizeUid(f.readStringUntil('\n'));
-  emergencyCode = f.readStringUntil('\n');
+
+  file.println(cleanUid(masterCard));
+  file.println(emergencyCode);
+  file.println(closeNext ? "1" : "0");
+
+  file.close();
+}
+
+void loadSettings() {
+  if (!LittleFS.exists("/settings.txt")) {
+    saveSettings();
+    return;
+  }
+
+  File file = LittleFS.open("/settings.txt", "r");
+
+  if (!file) {
+    return;
+  }
+
+  masterCard = cleanUid(file.readStringUntil('\n'));
+
+  emergencyCode = file.readStringUntil('\n');
   emergencyCode.trim();
-  String nr = f.readStringUntil('\n');
-  nr.trim();
-  nextRelay = (nr == "1");
-  f.close();
+
+  String relayState = file.readStringUntil('\n');
+  relayState.trim();
+
+  closeNext = relayState == "1";
+
+  file.close();
 }
 
 void saveCards() {
-  File f = LittleFS.open("/cards.txt", "w");
-  if (!f) return;
-  for (int i = 0; i < cardCount; i++) {
-    f.println(normalizeUid(cards[i].uid) + ";" + cards[i].name);
+  File file = LittleFS.open("/cards.txt", "w");
+
+  if (!file) {
+    return;
   }
-  f.close();
+
+  for (int i = 0; i < cardCount; i++) {
+    file.println(cleanUid(cards[i].uid) + ";" + cards[i].name);
+  }
+
+  file.close();
 }
 
 void loadCards() {
   cardCount = 0;
-  if (!LittleFS.exists("/cards.txt")) return;
-  File f = LittleFS.open("/cards.txt", "r");
-  if (!f) return;
-  while (f.available() && cardCount < MAX_CARDS) {
-    String line = f.readStringUntil('\n');
+
+  if (!LittleFS.exists("/cards.txt")) {
+    return;
+  }
+
+  File file = LittleFS.open("/cards.txt", "r");
+
+  if (!file) {
+    return;
+  }
+
+  while (file.available() && cardCount < maxCards) {
+    String line = file.readStringUntil('\n');
     line.trim();
-    int p = line.indexOf(';');
-    if (p > 0) {
-      cards[cardCount].uid = normalizeUid(line.substring(0, p));
-      cards[cardCount].name = line.substring(p + 1);
+
+    int split = line.indexOf(';');
+
+    if (split > 0) {
+      cards[cardCount].uid = cleanUid(line.substring(0, split));
+      cards[cardCount].name = line.substring(split + 1);
       cards[cardCount].name.trim();
       cardCount++;
     }
   }
-  f.close();
+
+  file.close();
 }
 
 void saveLogs() {
-  File f = LittleFS.open("/logs.txt", "w");
-  if (!f) return;
-  for (int i = 0; i < logCount; i++) f.println(logs[i]);
-  f.close();
+  File file = LittleFS.open("/logs.txt", "w");
+
+  if (!file) {
+    return;
+  }
+
+  for (int i = 0; i < logCount; i++) {
+    file.println(logs[i]);
+  }
+
+  file.close();
 }
 
 void loadLogs() {
   logCount = 0;
-  if (!LittleFS.exists("/logs.txt")) return;
-  File f = LittleFS.open("/logs.txt", "r");
-  if (!f) return;
-  while (f.available() && logCount < MAX_LOGS) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0) logs[logCount++] = line;
+
+  if (!LittleFS.exists("/logs.txt")) {
+    return;
   }
-  f.close();
+
+  File file = LittleFS.open("/logs.txt", "r");
+
+  if (!file) {
+    return;
+  }
+
+  while (file.available() && logCount < maxLogs) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() > 0) {
+      logs[logCount] = line;
+      logCount++;
+    }
+  }
+
+  file.close();
 }
 
 void addLog(String text) {
-  for (int i = MAX_LOGS - 1; i > 0; i--) logs[i] = logs[i - 1];
-  logs[0] = nowTime() + " - " + text;
-  if (logCount < MAX_LOGS) logCount++;
+  for (int i = maxLogs - 1; i > 0; i--) {
+    logs[i] = logs[i - 1];
+  }
+
+  logs[0] = currentTime() + " - " + text;
+
+  if (logCount < maxLogs) {
+    logCount++;
+  }
+
   lastAction = text;
   saveLogs();
 }
 
 int findCard(String uid) {
-  uid = normalizeUid(uid);
+  uid = cleanUid(uid);
+
   for (int i = 0; i < cardCount; i++) {
-    if (normalizeUid(cards[i].uid) == uid) return i;
+    if (cleanUid(cards[i].uid) == uid) {
+      return i;
+    }
   }
+
   return -1;
 }
 
-String readRFID() {
-  static bool inFrame = false;
+String readCard() {
+  static bool reading = false;
   static byte data[20];
-  static int len = 0;
-  static unsigned long lastByte = 0;
-  while (RFID.available()) {
-    byte b = RFID.read();
-    lastByte = millis();
-    if (!inFrame) {
-      if (b == 0x02) {
-        inFrame = true;
-        len = 0;
-        data[len++] = b;
+  static int length = 0;
+  static unsigned long lastByteTime = 0;
+
+  while (rfid.available()) {
+    byte value = rfid.read();
+    lastByteTime = millis();
+
+    if (!reading) {
+      if (value == 0x02) {
+        reading = true;
+        length = 0;
+        data[length] = value;
+        length++;
       }
+
       continue;
     }
-    if (len < 20) data[len++] = b;
-    if (b == 0x03) {
+
+    if (length < 20) {
+      data[length] = value;
+      length++;
+    }
+
+    if (value == 0x03) {
       String uid = "";
-      for (int i = 0; i < len; i++) uid += byteToHex2(data[i]);
-      uid = normalizeUid(uid);
-      inFrame = false;
-      len = 0;
-      while (RFID.available()) RFID.read();
+
+      for (int i = 0; i < length; i++) {
+        uid += byteToHex(data[i]);
+      }
+
+      uid = cleanUid(uid);
+
+      reading = false;
+      length = 0;
+
+      while (rfid.available()) {
+        rfid.read();
+      }
+
       return uid;
     }
   }
-  if (inFrame && millis() - lastByte > 300) {
-    inFrame = false;
-    len = 0;
+
+  if (reading && millis() - lastByteTime > 300) {
+    reading = false;
+    length = 0;
   }
+
   return "";
 }
 
-void triggerRelay(String user) {
-  Serial.println("TRIGGER RELAY START");
-  if (!nextRelay) {
-    statusText = "Schrank wird geoeffnet";
-    Serial.println("Relay 1 ON");
-    relayPulse(RELAY1);
-    Serial.println("Relay 1 OFF");
-    addLog(user + " - Relais 1 / Oeffnen");
+void openOrClose(String user) {
+  if (!closeNext) {
+    statusText = "Opening locker";
+    pulseRelay(openRelayPin);
+    addLog(user + " opened the locker");
   } else {
-    statusText = "Schrank wird geschlossen";
-    Serial.println("Relay 2 ON");
-    relayPulse(RELAY2);
-    Serial.println("Relay 2 OFF");
-    addLog(user + " - Relais 2 / Schliessen");
+    statusText = "Closing locker";
+    pulseRelay(closeRelayPin);
+    addLog(user + " closed the locker");
   }
-  nextRelay = !nextRelay;
-  saveConfig();
-  statusText = "Bereit";
-  Serial.println("TRIGGER RELAY END");
+
+  closeNext = !closeNext;
+  saveSettings();
+
+  statusText = "Ready";
 }
 
-void handleRFID(String uid) {
-  if (uid.length() < 4) return;
-  if (millis() - lastCardTime < 1800) return;
+void handleCard(String uid) {
+  if (uid.length() < 4) {
+    return;
+  }
+
+  if (millis() - lastCardTime < 1800) {
+    return;
+  }
+
   lastCardTime = millis();
-  uid = normalizeUid(uid);
-  Serial.println("==========");
-  Serial.print("RFID UID HEX: ");
+  uid = cleanUid(uid);
+
+  Serial.println("----------");
+  Serial.print("Card UID: ");
   Serial.println(uid);
-  Serial.print("Gespeicherte Karten: ");
-  Serial.println(cardCount);
-  for (int i = 0; i < cardCount; i++) {
-    Serial.print(" - ");
-    Serial.print(cards[i].name);
-    Serial.print(" = ");
-    Serial.println(cards[i].uid);
-  }
-  if (uid == normalizeUid(masterCard)) {
-    learnMode = true;
-    pendingCard = "";
-    statusText = "Masterkarte erkannt - neue Karte scannen";
-    addLog("Masterkarte erkannt");
-    Serial.println("Masterkarte erkannt");
+
+  if (uid == cleanUid(masterCard)) {
+    learningMode = true;
+    newCardUid = "";
+    statusText = "Master card accepted. Scan a new card.";
+    addLog("Master card accepted");
+    Serial.println("Master card accepted");
     return;
   }
-  if (learnMode) {
-    pendingCard = uid;
-    learnMode = false;
-    statusText = "Neue Karte erkannt - Name im Web eingeben";
-    addLog("Neue Karte wartet auf Namen: " + uid);
-    Serial.println("Neue Karte erkannt. Name im Web eingeben.");
+
+  if (learningMode) {
+    learningMode = false;
+    newCardUid = uid;
+    statusText = "New card found. Enter a name in the web page.";
+    addLog("New card is waiting for a name");
+    Serial.println("New card found");
     return;
   }
-  int idx = findCard(uid);
-  if (idx >= 0) {
-    Serial.print("Benutzer: ");
-    Serial.println(cards[idx].name);
-    triggerRelay(cards[idx].name);
+
+  int cardIndex = findCard(uid);
+
+  if (cardIndex >= 0) {
+    openOrClose(cards[cardIndex].name);
   } else {
-    statusText = "Unbekannte Karte";
-    addLog("Unbekannte Karte: " + uid);
-    Serial.println("Unbekannte Karte");
+    statusText = "Unknown card";
+    addLog("Unknown card: " + uid);
+    Serial.println("Unknown card");
   }
 }
 
 String pageStart(String title) {
-  String h = "<!DOCTYPE html><html lang='de'><head><meta charset='UTF-8'>";
-  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  h += "<title>" + title + "</title>";
-  h += "<style>body{font-family:Arial;background:#10141c;color:#eee;margin:0;padding:16px}h2{margin-top:0}.box{background:#1d2533;padding:14px;margin:12px 0;border-radius:14px;box-shadow:0 2px 12px #0005}.ok{color:#43f28f}.warn{color:#ffd166}.bad{color:#ff6961}a{color:#59c7ff;text-decoration:none}input,button{font-size:17px;padding:10px;margin:6px 0;border-radius:9px;border:0}input{width:94%;background:#0f1722;color:#eee;border:1px solid #40516b}button{background:#2f9bff;color:white;font-weight:bold}small{color:#aaa}.row{border-bottom:1px solid #334;padding:8px 0}</style>";
-  h += "<meta http-equiv='refresh' content='8'>";
-  h += "</head><body><h2>Schranksteuerung</h2>";
-  return h;
+  String page = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>";
+  page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<title>" + title + "</title>";
+  page += "<style>";
+  page += "body{font-family:Arial;background:#10141c;color:#eee;margin:0;padding:16px}";
+  page += "h2{margin-top:0}";
+  page += ".box{background:#1d2533;padding:14px;margin:12px 0;border-radius:14px;box-shadow:0 2px 12px #0005}";
+  page += ".ok{color:#43f28f}";
+  page += ".warn{color:#ffd166}";
+  page += ".bad{color:#ff6961}";
+  page += "a{color:#59c7ff;text-decoration:none}";
+  page += "input,button{font-size:17px;padding:10px;margin:6px 0;border-radius:9px;border:0}";
+  page += "input{width:94%;background:#0f1722;color:#eee;border:1px solid #40516b}";
+  page += "button{background:#2f9bff;color:white;font-weight:bold}";
+  page += "small{color:#aaa}";
+  page += ".row{border-bottom:1px solid #334;padding:8px 0}";
+  page += "</style>";
+  page += "<meta http-equiv='refresh' content='8'>";
+  page += "</head><body><h2>Locker Control</h2>";
+
+  return page;
 }
 
 String pageEnd() {
   return "</body></html>";
 }
 
-void handleRoot() {
-  String h = pageStart("Schranksteuerung");
-  h += "<div class='box'><h3>Status</h3><p class='ok'>" + htmlEscape(statusText) + "</p><small>Letzte Aktion: " + htmlEscape(lastAction) + "</small><br><small>Uhrzeit: " + nowTime() + "</small></div>";
-  if (pendingCard.length() > 0) {
-    h += "<div class='box'><h3>Neue Karte speichern</h3><p>UID: <b>" + pendingCard + "</b></p>";
-    h += "<form action='/savecard' method='POST'><input name='name' placeholder='Name eingeben' required><button>Karte speichern</button></form></div>";
-  } else if (learnMode) {
-    h += "<div class='box warn'><h3>Lernmodus aktiv</h3><p>Bitte neue Karte scannen.</p></div>";
+void homePage() {
+  String page = pageStart("Locker Control");
+
+  page += "<div class='box'>";
+  page += "<h3>Status</h3>";
+  page += "<p class='ok'>" + safeText(statusText) + "</p>";
+  page += "<small>Last action: " + safeText(lastAction) + "</small><br>";
+  page += "<small>Time: " + currentTime() + "</small>";
+  page += "</div>";
+
+  if (newCardUid.length() > 0) {
+    page += "<div class='box'>";
+    page += "<h3>Save New Card</h3>";
+    page += "<p>UID: <b>" + newCardUid + "</b></p>";
+    page += "<form action='/savecard' method='POST'>";
+    page += "<input name='name' placeholder='Enter a name' required>";
+    page += "<button>Save Card</button>";
+    page += "</form>";
+    page += "</div>";
+  } else if (learningMode) {
+    page += "<div class='box warn'>";
+    page += "<h3>Learning Mode</h3>";
+    page += "<p>Please scan the new card.</p>";
+    page += "</div>";
   }
-  h += "<div class='box'><h3>Notfallcode</h3><form action='/code' method='POST'><input name='code' placeholder='Code'><button>Oeffnen / Schliessen</button></form></div>";
-  h += "<div class='box'><h3>Menue</h3><p><a href='/cards'>Karten verwalten</a></p><p><a href='/logs'>Letzte 20 Aktionen</a></p><p><a href='/settings'>Einstellungen</a></p><p><a href='/time'>Uhrzeit einstellen</a></p></div>";
-  h += "<div class='box'><h3>Letzte Aktionen</h3>";
-  for (int i = 0; i < logCount; i++) h += "<div class='row'>" + htmlEscape(logs[i]) + "</div>";
-  h += "</div>" + pageEnd();
-  server.send(200, "text/html", h);
+
+  page += "<div class='box'>";
+  page += "<h3>Emergency Code</h3>";
+  page += "<form action='/code' method='POST'>";
+  page += "<input name='code' placeholder='Enter code'>";
+  page += "<button>Open / Close</button>";
+  page += "</form>";
+  page += "</div>";
+
+  page += "<div class='box'>";
+  page += "<h3>Menu</h3>";
+  page += "<p><a href='/cards'>Manage Cards</a></p>";
+  page += "<p><a href='/logs'>Last 20 Actions</a></p>";
+  page += "<p><a href='/settings'>Settings</a></p>";
+  page += "<p><a href='/time'>Set Time</a></p>";
+  page += "</div>";
+
+  page += "<div class='box'>";
+  page += "<h3>Last Actions</h3>";
+
+  for (int i = 0; i < logCount; i++) {
+    page += "<div class='row'>" + safeText(logs[i]) + "</div>";
+  }
+
+  page += "</div>";
+  page += pageEnd();
+
+  server.send(200, "text/html", page);
 }
 
-void handleCode() {
+void codePage() {
   String code = server.arg("code");
   code.trim();
-  if (code == emergencyCode) triggerRelay("Notfallcode");
-  else {
-    statusText = "Falscher Notfallcode";
-    addLog("Falscher Notfallcode");
+
+  if (code == emergencyCode) {
+    openOrClose("Emergency code");
+  } else {
+    statusText = "Wrong emergency code";
+    addLog("Wrong emergency code");
   }
+
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-void handleSaveCard() {
-  if (pendingCard.length() == 0) {
+void saveCardPage() {
+  if (newCardUid.length() == 0) {
     server.sendHeader("Location", "/");
     server.send(303);
     return;
   }
-  String name = urlDecode(server.arg("name"));
+
+  String name = decodeUrl(server.arg("name"));
   name.trim();
-  if (name.length() == 0) name = "Benutzer";
-  int idx = findCard(pendingCard);
-  if (idx >= 0) cards[idx].name = name;
-  else if (cardCount < MAX_CARDS) {
-    cards[cardCount].uid = normalizeUid(pendingCard);
+
+  if (name.length() == 0) {
+    name = "User";
+  }
+
+  int cardIndex = findCard(newCardUid);
+
+  if (cardIndex >= 0) {
+    cards[cardIndex].name = name;
+  } else if (cardCount < maxCards) {
+    cards[cardCount].uid = cleanUid(newCardUid);
     cards[cardCount].name = name;
     cardCount++;
   } else {
-    addLog("Kartenlimit erreicht");
-    pendingCard = "";
+    addLog("Card limit reached");
+    newCardUid = "";
     server.sendHeader("Location", "/cards");
     server.send(303);
     return;
   }
-  addLog("Karte gespeichert: " + name);
-  pendingCard = "";
+
+  addLog("Card saved: " + name);
+
+  newCardUid = "";
+
   saveCards();
+
   server.sendHeader("Location", "/cards");
   server.send(303);
 }
 
-void handleCards() {
-  String h = pageStart("Karten verwalten");
-  h += "<div class='box'><h3>Karten verwalten</h3><p>Maximal 5 Karten. Zum Hinzufuegen zuerst Masterkarte scannen, dann neue Karte scannen.</p>";
-  h += "<p>Gespeichert: " + String(cardCount) + " / " + String(MAX_CARDS) + "</p>";
+void cardsPage() {
+  String page = pageStart("Manage Cards");
+
+  page += "<div class='box'>";
+  page += "<h3>Manage Cards</h3>";
+  page += "<p>Maximum 5 cards. To add a card, scan the master card first. Then scan the new card.</p>";
+  page += "<p>Saved cards: " + String(cardCount) + " / " + String(maxCards) + "</p>";
+
   for (int i = 0; i < cardCount; i++) {
-    h += "<div class='row'><b>" + htmlEscape(cards[i].name) + "</b><br><small>UID: " + cards[i].uid + "</small><br>";
-    h += "<form action='/rename' method='POST'><input type='hidden' name='id' value='" + String(i) + "'><input name='name' placeholder='Neuer Name'><button>Umbenennen</button></form>";
-    h += "<a class='bad' href='/delete?id=" + String(i) + "'>Loeschen</a></div>";
+    page += "<div class='row'>";
+    page += "<b>" + safeText(cards[i].name) + "</b><br>";
+    page += "<small>UID: " + cards[i].uid + "</small><br>";
+    page += "<form action='/rename' method='POST'>";
+    page += "<input type='hidden' name='id' value='" + String(i) + "'>";
+    page += "<input name='name' placeholder='New name'>";
+    page += "<button>Rename</button>";
+    page += "</form>";
+    page += "<a class='bad' href='/delete?id=" + String(i) + "'>Delete</a>";
+    page += "</div>";
   }
-  h += "<p><a href='/'>Zurueck</a></p></div>" + pageEnd();
-  server.send(200, "text/html", h);
+
+  page += "<p><a href='/'>Back</a></p>";
+  page += "</div>";
+  page += pageEnd();
+
+  server.send(200, "text/html", page);
 }
 
-void handleRename() {
+void renameCardPage() {
   int id = server.arg("id").toInt();
-  String name = urlDecode(server.arg("name"));
+
+  String name = decodeUrl(server.arg("name"));
   name.trim();
+
   if (id >= 0 && id < cardCount && name.length() > 0) {
     cards[id].name = name;
     saveCards();
-    addLog("Karte umbenannt: " + name);
+    addLog("Card renamed: " + name);
   }
+
   server.sendHeader("Location", "/cards");
   server.send(303);
 }
 
-void handleDelete() {
+void deleteCardPage() {
   int id = server.arg("id").toInt();
+
   if (id >= 0 && id < cardCount) {
-    addLog("Karte geloescht: " + cards[id].name);
-    for (int i = id; i < cardCount - 1; i++) cards[i] = cards[i + 1];
+    addLog("Card deleted: " + cards[id].name);
+
+    for (int i = id; i < cardCount - 1; i++) {
+      cards[i] = cards[i + 1];
+    }
+
     cardCount--;
     saveCards();
   }
+
   server.sendHeader("Location", "/cards");
   server.send(303);
 }
 
-void handleLogs() {
-  String h = pageStart("Letzte 20 Aktionen");
-  h += "<div class='box'><h3>Letzte 20 Aktionen</h3>";
-  for (int i = 0; i < logCount; i++) h += "<div class='row'>" + htmlEscape(logs[i]) + "</div>";
-  h += "<p><a href='/clearlogs'>Logs loeschen</a></p><p><a href='/'>Zurueck</a></p></div>" + pageEnd();
-  server.send(200, "text/html", h);
+void logsPage() {
+  String page = pageStart("Last 20 Actions");
+
+  page += "<div class='box'>";
+  page += "<h3>Last 20 Actions</h3>";
+
+  for (int i = 0; i < logCount; i++) {
+    page += "<div class='row'>" + safeText(logs[i]) + "</div>";
+  }
+
+  page += "<p><a href='/clearlogs'>Clear Logs</a></p>";
+  page += "<p><a href='/'>Back</a></p>";
+  page += "</div>";
+  page += pageEnd();
+
+  server.send(200, "text/html", page);
 }
 
-void handleClearLogs() {
+void clearLogsPage() {
   logCount = 0;
   saveLogs();
-  addLog("Logs geloescht");
+  addLog("Logs cleared");
+
   server.sendHeader("Location", "/logs");
   server.send(303);
 }
 
-void handleSettings() {
-  String h = pageStart("Einstellungen");
-  h += "<div class='box'><h3>Einstellungen</h3>";
-  h += "<p><b>Masterkarte:</b><br><small>" + masterCard + "</small></p>";
-  h += "<form action='/setmaster' method='POST'><input name='uid' placeholder='Neue Master UID HEX'><button>Masterkarte speichern</button></form>";
-  h += "<p><b>Notfallcode:</b> " + emergencyCode + "</p>";
-  h += "<form action='/setcode' method='POST'><input name='code' placeholder='Neuer Code'><button>Code speichern</button></form>";
-  h += "<p><a href='/time'>Uhrzeit einstellen</a></p><p><a href='/'>Zurueck</a></p></div>" + pageEnd();
-  server.send(200, "text/html", h);
+void settingsPage() {
+  String page = pageStart("Settings");
+
+  page += "<div class='box'>";
+  page += "<h3>Settings</h3>";
+
+  page += "<p><b>Master card:</b><br>";
+  page += "<small>" + masterCard + "</small></p>";
+
+  page += "<form action='/setmaster' method='POST'>";
+  page += "<input name='uid' placeholder='New master UID'>";
+  page += "<button>Save Master Card</button>";
+  page += "</form>";
+
+  page += "<p><b>Emergency code:</b> " + safeText(emergencyCode) + "</p>";
+
+  page += "<form action='/setcode' method='POST'>";
+  page += "<input name='code' placeholder='New code'>";
+  page += "<button>Save Code</button>";
+  page += "</form>";
+
+  page += "<p><a href='/time'>Set Time</a></p>";
+  page += "<p><a href='/'>Back</a></p>";
+
+  page += "</div>";
+  page += pageEnd();
+
+  server.send(200, "text/html", page);
 }
 
-void handleSetMaster() {
-  String uid = normalizeUid(server.arg("uid"));
+void setMasterPage() {
+  String uid = cleanUid(server.arg("uid"));
+
   if (uid.length() >= 4) {
     masterCard = uid;
-    saveConfig();
-    addLog("Masterkarte geaendert");
+    saveSettings();
+    addLog("Master card changed");
   }
+
   server.sendHeader("Location", "/settings");
   server.send(303);
 }
 
-void handleSetCode() {
+void setCodePage() {
   String code = server.arg("code");
   code.trim();
-  if (code.length() >= 1) {
+
+  if (code.length() > 0) {
     emergencyCode = code;
-    saveConfig();
-    addLog("Notfallcode geaendert");
+    saveSettings();
+    addLog("Emergency code changed");
   }
+
   server.sendHeader("Location", "/settings");
   server.send(303);
 }
 
-void handleTimePage() {
-  RtcDateTime now = Rtc.GetDateTime();
-  String h = pageStart("Uhrzeit einstellen");
-  h += "<div class='box'><h3>Uhrzeit einstellen</h3><p>Aktuelle RTC-Zeit: <b>" + nowTime() + "</b></p>";
-  h += "<form action='/settime' method='POST'>";
-  h += "<input name='year' type='number' min='2024' max='2099' placeholder='Jahr' value='" + String(now.IsValid() ? now.Year() : 2026) + "'>";
-  h += "<input name='month' type='number' min='1' max='12' placeholder='Monat' value='" + String(now.IsValid() ? now.Month() : 1) + "'>";
-  h += "<input name='day' type='number' min='1' max='31' placeholder='Tag' value='" + String(now.IsValid() ? now.Day() : 1) + "'>";
-  h += "<input name='hour' type='number' min='0' max='23' placeholder='Stunde' value='" + String(now.IsValid() ? now.Hour() : 19) + "'>";
-  h += "<input name='minute' type='number' min='0' max='59' placeholder='Minute' value='" + String(now.IsValid() ? now.Minute() : 47) + "'>";
-  h += "<input name='second' type='number' min='0' max='59' placeholder='Sekunde' value='0'>";
-  h += "<button>Uhrzeit speichern</button></form><p><a href='/settings'>Zurueck</a></p></div>" + pageEnd();
-  server.send(200, "text/html", h);
+void timePage() {
+  RtcDateTime now = rtc.GetDateTime();
+
+  String page = pageStart("Set Time");
+
+  page += "<div class='box'>";
+  page += "<h3>Set Time</h3>";
+  page += "<p>Current RTC time: <b>" + currentTime() + "</b></p>";
+
+  page += "<form action='/settime' method='POST'>";
+  page += "<input name='year' type='number' min='2024' max='2099' placeholder='Year' value='" + String(now.IsValid() ? now.Year() : 2026) + "'>";
+  page += "<input name='month' type='number' min='1' max='12' placeholder='Month' value='" + String(now.IsValid() ? now.Month() : 1) + "'>";
+  page += "<input name='day' type='number' min='1' max='31' placeholder='Day' value='" + String(now.IsValid() ? now.Day() : 1) + "'>";
+  page += "<input name='hour' type='number' min='0' max='23' placeholder='Hour' value='" + String(now.IsValid() ? now.Hour() : 12) + "'>";
+  page += "<input name='minute' type='number' min='0' max='59' placeholder='Minute' value='" + String(now.IsValid() ? now.Minute() : 0) + "'>";
+  page += "<input name='second' type='number' min='0' max='59' placeholder='Second' value='0'>";
+  page += "<button>Save Time</button>";
+  page += "</form>";
+
+  page += "<p><a href='/settings'>Back</a></p>";
+  page += "</div>";
+  page += pageEnd();
+
+  server.send(200, "text/html", page);
 }
 
-void handleSetTime() {
-  int y = server.arg("year").toInt();
-  int m = server.arg("month").toInt();
-  int d = server.arg("day").toInt();
-  int h = server.arg("hour").toInt();
-  int mi = server.arg("minute").toInt();
-  int s = server.arg("second").toInt();
-  if (y >= 2024 && y <= 2099 && m >= 1 && m <= 12 && d >= 1 && d <= 31 && h >= 0 && h <= 23 && mi >= 0 && mi <= 59 && s >= 0 && s <= 59) {
-    Rtc.SetIsWriteProtected(false);
-    Rtc.SetIsRunning(true);
-    Rtc.SetDateTime(RtcDateTime(y, m, d, h, mi, s));
-    addLog("Uhrzeit eingestellt");
+void setTimePage() {
+  int year = server.arg("year").toInt();
+  int month = server.arg("month").toInt();
+  int day = server.arg("day").toInt();
+  int hour = server.arg("hour").toInt();
+  int minute = server.arg("minute").toInt();
+  int second = server.arg("second").toInt();
+
+  bool validTime =
+    year >= 2024 && year <= 2099 &&
+    month >= 1 && month <= 12 &&
+    day >= 1 && day <= 31 &&
+    hour >= 0 && hour <= 23 &&
+    minute >= 0 && minute <= 59 &&
+    second >= 0 && second <= 59;
+
+  if (validTime) {
+    rtc.SetIsWriteProtected(false);
+    rtc.SetIsRunning(true);
+    rtc.SetDateTime(RtcDateTime(year, month, day, hour, minute, second));
+    addLog("Time changed");
   }
+
   server.sendHeader("Location", "/time");
   server.send(303);
 }
 
 void setup() {
-  pinMode(RELAY1, OUTPUT);
-  pinMode(RELAY2, OUTPUT);
-  digitalWrite(RELAY1, RELAY_OFF);
-  digitalWrite(RELAY2, RELAY_OFF);
-  delay(100);
+  pinMode(openRelayPin, OUTPUT);
+  pinMode(closeRelayPin, OUTPUT);
+
+  turnRelaysOff();
+
   Serial.begin(115200);
   delay(800);
+
   Serial.println();
-  Serial.println("Locker-System startet...");
-  Serial.println("Relais: LOW=OFF, HIGH=ON");
-  RFID.begin(9600);
-  if (!LittleFS.begin()) Serial.println("LittleFS Fehler");
-  loadConfig();
+  Serial.println("Locker system is starting");
+
+  rfid.begin(9600);
+
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS error");
+  }
+
+  loadSettings();
   loadCards();
   loadLogs();
-  setupRtc();
-  relaysOff();
+
+  startClock();
+  turnRelaysOff();
+
   WiFi.mode(WIFI_AP);
-  bool apOk = WiFi.softAP(WIFI_SSID, WIFI_PASS);
-  Serial.print("AP Status: ");
-  Serial.println(apOk);
-  Serial.print("SSID: ");
-  Serial.println(WIFI_SSID);
-  Serial.print("Passwort: ");
-  Serial.println(WIFI_PASS);
-  Serial.print("IP: ");
+
+  bool wifiStarted = WiFi.softAP(wifiName, wifiPassword);
+
+  Serial.print("WiFi started: ");
+  Serial.println(wifiStarted ? "yes" : "no");
+
+  Serial.print("WiFi name: ");
+  Serial.println(wifiName);
+
+  Serial.print("WiFi password: ");
+  Serial.println(wifiPassword);
+
+  Serial.print("IP address: ");
   Serial.println(WiFi.softAPIP());
-  server.on("/", handleRoot);
-  server.on("/code", HTTP_POST, handleCode);
-  server.on("/savecard", HTTP_POST, handleSaveCard);
-  server.on("/cards", handleCards);
-  server.on("/rename", HTTP_POST, handleRename);
-  server.on("/delete", handleDelete);
-  server.on("/logs", handleLogs);
-  server.on("/clearlogs", handleClearLogs);
-  server.on("/settings", handleSettings);
-  server.on("/setmaster", HTTP_POST, handleSetMaster);
-  server.on("/setcode", HTTP_POST, handleSetCode);
-  server.on("/time", handleTimePage);
-  server.on("/settime", HTTP_POST, handleSetTime);
+
+  server.on("/", homePage);
+  server.on("/code", HTTP_POST, codePage);
+  server.on("/savecard", HTTP_POST, saveCardPage);
+  server.on("/cards", cardsPage);
+  server.on("/rename", HTTP_POST, renameCardPage);
+  server.on("/delete", deleteCardPage);
+  server.on("/logs", logsPage);
+  server.on("/clearlogs", clearLogsPage);
+  server.on("/settings", settingsPage);
+  server.on("/setmaster", HTTP_POST, setMasterPage);
+  server.on("/setcode", HTTP_POST, setCodePage);
+  server.on("/time", timePage);
+  server.on("/settime", HTTP_POST, setTimePage);
+
   server.begin();
-  addLog("System gestartet");
-  relaysOff();
+
+  addLog("System started");
+  turnRelaysOff();
+
+  Serial.println("System is ready");
 }
 
 void loop() {
   server.handleClient();
-  String uid = readRFID();
-  if (uid.length() > 0) handleRFID(uid);
+
+  String uid = readCard();
+
+  if (uid.length() > 0) {
+    handleCard(uid);
+  }
 }
